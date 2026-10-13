@@ -1,0 +1,80 @@
+name: ZIP para APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: "Caminho do ZIP no repositorio"
+        required: true
+        default: "androidsdk.zip"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ZIP: ${{ inputs.zip }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Extrair ZIP
+        run: |
+          rm -rf "$RUNNER_TEMP/proj" && mkdir -p "$RUNNER_TEMP/proj"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/proj"
+          cd "$RUNNER_TEMP/proj"
+          for i in 1 2 3; do
+            if [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then break; fi
+            d=$(find . -maxdepth 1 -mindepth 1 -type d ! -name '__MACOSX' | head -n1)
+            if [ -n "$d" ]; then cd "$d"; fi
+          done
+          echo "PROJ=$(pwd)" >> "$GITHUB_ENV"
+
+      - name: Compilar
+        run: |
+          cd "$PROJ"
+          if [ -f gradlew ]; then chmod +x gradlew; G=./gradlew; else G=gradle; fi
+          $G --no-daemon assembleRelease || $G --no-daemon assembleDebug
+
+      - name: Assinar
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
+        run: |
+          cd "$PROJ"
+          APK=$(find . -path '*build/outputs/apk*' -name '*.apk' | sort | head -n1)
+          if [ -z "$APK" ]; then echo "Nenhum APK encontrado"; exit 1; fi
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)
+          ALIAS="${KS_ALIAS:-key}"
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > ks.jks
+            PASS="$KS_PASS"
+          else
+            PASS="android1234"
+            keytool -genkeypair -keystore ks.jks -alias "$ALIAS" -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass "$PASS" -keypass "$PASS" -dname "CN=ANDROIDSDK"
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          "$ANDROID_HOME/build-tools/$BT/zipalign" -f -p 4 "$APK" aligned.apk
+          "$ANDROID_HOME/build-tools/$BT/apksigner" sign --ks ks.jks --ks-key-alias "$ALIAS" \
+            --ks-pass "pass:$PASS" --key-pass "pass:$PASS" \
+            --out "$GITHUB_WORKSPACE/out/app-assinado.apk" aligned.apk
+
+      - name: Publicar APK
+        run: |
+          gh release create "build-${{ github.run_number }}" out/app-assinado.apk \
+            --title "APK build ${{ github.run_number }}" \
+            --notes "Gerado a partir de $ZIP" \
+            --repo "$GITHUB_REPOSITORY"
